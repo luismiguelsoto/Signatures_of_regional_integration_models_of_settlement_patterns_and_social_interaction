@@ -1,0 +1,1 @@
+# Signatures_of_regional_integration_models_of_settlement_patterns_and_social_interaction
