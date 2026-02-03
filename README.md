@@ -13,7 +13,7 @@ Repository Structure:
      • Filandia_Sitios_Periodo_Temprano (Periods: Early, Middle, Late)
 
 2. R Code Files:
-   - The main R script (JAS_RNOTEBOOK_CLEAN.Rmd) contains the code to:
+   - The main R script (JAS_RNOTEBOOK_GITHUB_SPRING_2026) contains the code to:
      a) Load required packages and configure the environment.
      b) Download GIS files directly from GitHub using a raw URL connection.
      c) Perform spatial metric calculations, TDA, network analysis, and ML classification.
