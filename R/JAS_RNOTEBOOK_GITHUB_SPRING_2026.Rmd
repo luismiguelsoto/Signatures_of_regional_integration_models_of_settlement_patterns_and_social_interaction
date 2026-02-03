@@ -1,0 +1,1104 @@
+---
+title: 'Signatures of regional integration and models of settlement patterns in the Tairona and Quimbaya chiefdoms'
+author: "Luis Miguel Soto Rodriguez, PhD student, University of Pittsburgh"
+date: '`r Sys.Date()`'
+output:
+  word_document:
+    toc: true
+  pdf_document: default
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE)
+options(digits = 4)
+```
+
+# Section 1: Configuration and Packages
+
+```{r configuration}
+github_base_url <- "https://raw.githubusercontent.com/luismiguelsoto/Signatures_of_regional_integration_models_of_settlement_patterns_and_social_interaction/main/GIS/"
+
+temp_dir <- tempdir()
+
+packages <- c("sf", "sp", "dplyr", "tibble", "ggplot2", 
+              "spatstat.geom", "spatstat.explore", "spatstat.random",
+              "TDA", "igraph", "tidyr", "gridExtra", "patchwork", 
+              "ggspatial", "scales", "boot", "rstatix", "ggpubr",
+              "randomForest", "caret", "httr")
+
+install_pkg <- function(p) { if (!requireNamespace(p, quietly = TRUE)) install.packages(p) }
+invisible(lapply(packages, install_pkg))
+invisible(lapply(packages, function(p) suppressPackageStartupMessages(library(p, character.only = TRUE))))
+
+download_shapefile <- function(shapefile_name, base_url, dest_dir) {
+  extensions <- c(".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx")
+  
+  for(ext in extensions) {
+    file_url <- paste0(base_url, shapefile_name, ext)
+    dest_file <- file.path(dest_dir, paste0(shapefile_name, ext))
+    
+    response <- tryCatch(
+      GET(file_url, write_disk(dest_file, overwrite = TRUE)),
+      error = function(e) NULL
+    )
+  }
+  
+  file.path(dest_dir, paste0(shapefile_name, ".shp"))
+}
+
+set.seed(42)
+```
+
+# Section 2: Data Loading
+
+```{r data_loading}
+shapefile_names <- c(
+  "Rio_Frio_Limite_Survey",
+  "Filandia_Limite_Survey",
+  "Rio_Frio_Sitios_Neguanje",
+  "Rio_Frio_Sitios_Buritaca",
+  "Rio_Frio_Sitios_Tairona",
+  "Filandia_Sitios_Periodo_Temprano",
+  "Filandia_Sitios_Periodo_Medio",
+  "Filandia_Sitios_Periodo_Tardio"
+)
+
+shp_paths <- sapply(shapefile_names, function(name) {
+  download_shapefile(name, github_base_url, temp_dir)
+})
+
+read_clean <- function(shp_path) {
+  x <- st_read(shp_path, quiet = TRUE)
+  x <- st_make_valid(x)
+  x[!st_is_empty(x), ]
+}
+
+bound_tairona  <- read_clean(shp_paths["Rio_Frio_Limite_Survey"])
+bound_quimbaya <- read_clean(shp_paths["Filandia_Limite_Survey"])
+
+epsg <- st_crs(bound_tairona)$epsg
+if(is.na(epsg)) epsg <- 32618
+
+bound_tairona  <- st_transform(bound_tairona, epsg)
+bound_quimbaya <- st_transform(bound_quimbaya, epsg)
+
+sites_tairona <- list(
+  Neguanje = st_transform(read_clean(shp_paths["Rio_Frio_Sitios_Neguanje"]), epsg),
+  Buritaca = st_transform(read_clean(shp_paths["Rio_Frio_Sitios_Buritaca"]), epsg),
+  Tairona  = st_transform(read_clean(shp_paths["Rio_Frio_Sitios_Tairona"]), epsg)
+)
+
+sites_quimbaya <- list(
+  Early    = st_transform(read_clean(shp_paths["Filandia_Sitios_Periodo_Temprano"]), epsg),
+  Middle   = st_transform(read_clean(shp_paths["Filandia_Sitios_Periodo_Medio"]), epsg),
+  Late     = st_transform(read_clean(shp_paths["Filandia_Sitios_Periodo_Tardio"]), epsg)
+)
+
+rm(read_clean)
+gc(verbose = FALSE)
+```
+
+# Section 3: Spatial Conversion
+
+```{r spatial_conversion}
+sf_to_ppp <- function(points_sf, bound_sf) {
+  win <- as.owin(st_make_valid(st_union(st_geometry(bound_sf))))
+  pts <- suppressWarnings(st_point_on_surface(st_make_valid(points_sf)))
+  cc <- st_coordinates(pts)
+  pp <- ppp(x = cc[,1], y = cc[,2], window = win)
+  pp[win]
+}
+
+build_ppp_list <- function(site_list, bound) {
+  lapply(site_list, function(x) sf_to_ppp(x, bound))
+}
+
+ppp_tairona  <- build_ppp_list(sites_tairona, bound_tairona)
+ppp_quimbaya <- build_ppp_list(sites_quimbaya, bound_quimbaya)
+
+rm(sites_tairona, sites_quimbaya, sf_to_ppp, build_ppp_list)
+gc(verbose = FALSE)
+```
+
+# Section 4: Table 1 - Settlement Pattern Metrics
+
+```{r settlement_metrics}
+calc_baseline_metrics <- function(pp_list, region) {
+  bind_rows(lapply(names(pp_list), function(p) {
+    pp <- pp_list[[p]]
+    area_km2 <- area.owin(pp$window) / 1e6
+    nn_dists <- nndist(pp)
+    
+    ce_test <- clarkevans.test(pp, correction = "cdf", alternative = "clustered")
+    
+    tibble(
+      Region = region, 
+      Period = p, 
+      Survey_Area_km2 = round(area_km2, 2),
+      N_Sites = pp$n,
+      Settlement_Density = round(pp$n / area_km2, 2),
+      Mean_Spacing_m = round(mean(nn_dists), 1),
+      Clark_Evans_R = round(as.numeric(ce_test$statistic), 2),
+      Pattern_Type = case_when(
+        as.numeric(ce_test$statistic) < 0.9 ~ "Aggregated",
+        as.numeric(ce_test$statistic) > 1.1 ~ "Regular",
+        TRUE ~ "Random"
+      )
+    )
+  }))
+}
+
+table1 <- bind_rows(
+  calc_baseline_metrics(ppp_tairona, "Tairona"), 
+  calc_baseline_metrics(ppp_quimbaya, "Quimbaya")
+)
+
+# TABLE 1: SETTLEMENT DEMOGRAPHY AND SPATIAL SPACING
+print(table1)
+```
+
+# Section 5: Procedure 1 - Settlement Nucleation Intensity
+
+```{r settlement_intensity, fig.width=10, fig.height=10}
+surfer_pal <- c(
+  rgb(200, 215, 133, maxColorValue = 255),
+  rgb(117, 193, 120, maxColorValue = 255),
+  rgb(241, 207, 14, maxColorValue = 255),
+  rgb(242, 167, 0, maxColorValue = 255),
+  rgb(252, 236, 192, maxColorValue = 255),
+  rgb(115, 224, 241, maxColorValue = 255),
+  rgb(29, 188, 239, maxColorValue = 255),
+  rgb(0, 80, 250, maxColorValue = 255)
+)
+
+read_sf_from_github <- function(shapefile_name) {
+  shp_path <- shp_paths[shapefile_name]
+  x <- st_read(shp_path, quiet = TRUE)
+  x <- st_make_valid(x)
+  if(exists("bound_tairona")) {
+    x <- st_transform(x, st_crs(bound_tairona))
+  }
+  x[!st_is_empty(x), ]
+}
+
+sites_tairona_poly <- list(
+  Neguanje = read_sf_from_github("Rio_Frio_Sitios_Neguanje"),
+  Buritaca = read_sf_from_github("Rio_Frio_Sitios_Buritaca"),
+  Tairona  = read_sf_from_github("Rio_Frio_Sitios_Tairona")
+)
+
+sites_quimbaya_poly <- list(
+  Early  = read_sf_from_github("Filandia_Sitios_Periodo_Temprano"),
+  Middle = read_sf_from_github("Filandia_Sitios_Periodo_Medio"),
+  Late   = read_sf_from_github("Filandia_Sitios_Periodo_Tardio")
+)
+
+calc_weighted_intensity <- function(poly_sf, label, bound_sf) {
+  pts <- suppressWarnings(st_centroid(poly_sf))
+  coords <- st_coordinates(pts)
+  areas <- as.numeric(st_area(poly_sf)) / 10000
+  win <- as.owin(bound_sf)
+  pp_weighted <- ppp(x = coords[,1], y = coords[,2], window = win, marks = areas)
+  optimal_bw <- bw.ppl(pp_weighted)
+  dens <- density(pp_weighted, sigma = optimal_bw, weights = pp_weighted$marks, 
+                  edge = TRUE, diggle = TRUE, dimyx = 512)
+  df_rast <- as.data.frame(dens, xy = TRUE)
+  df_rast$value_scaled <- df_rast$value * 1e6
+  df_rast$Period <- label
+  df_rast
+}
+
+prepare_plot_data_weighted <- function(sites_sf_list, region_name, bound_sf) {
+  raster_list <- lapply(names(sites_sf_list), function(p) {
+    calc_weighted_intensity(sites_sf_list[[p]], p, bound_sf)
+  })
+  df_raster <- bind_rows(raster_list)
+  poly_list <- lapply(names(sites_sf_list), function(p) {
+    s <- sites_sf_list[[p]]
+    s$Period <- p
+    s[, "Period"]
+  })
+  df_poly <- bind_rows(poly_list)
+  if(region_name == "Tairona") {
+    lvls <- c("Neguanje", "Buritaca", "Tairona")
+  } else {
+    lvls <- c("Early", "Middle", "Late")
+  }
+  df_raster$Period <- factor(df_raster$Period, levels = lvls)
+  df_poly$Period <- factor(df_poly$Period, levels = lvls)
+  list(raster = df_raster, polygons = df_poly)
+}
+
+create_panel <- function(data, bounds, title_text) {
+  ggplot() +
+    geom_raster(data = data$raster, aes(x = x, y = y, fill = value_scaled), interpolate = TRUE) +
+    geom_sf(data = bounds, fill = NA, color = "black", linewidth = 0.8) +
+    geom_sf(data = data$polygons, fill = "black", color = "black") +
+    facet_wrap(~Period, nrow = 1) +
+    scale_fill_gradientn(colors = surfer_pal, name = "Density\n(Ha / km²)") +
+    coord_sf(crs = st_crs(bounds), expand = FALSE) +
+    theme_bw() +
+    annotation_scale(location = "br", width_hint = 0.2, style = "bar", text_cex = 0.7) +
+    annotation_north_arrow(location = "tl", which_north = "true", 
+                           style = north_arrow_fancy_orienteering(text_size = 7), 
+                           height = unit(1, "cm"), width = unit(1, "cm")) +
+    labs(title = title_text, x = NULL, y = NULL) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      strip.text = element_text(face = "bold", size = 11),
+      strip.background = element_rect(fill = "white"),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right"
+    )
+}
+
+d_tai <- prepare_plot_data_weighted(sites_tairona_poly, "Tairona", bound_tairona)
+d_qui <- prepare_plot_data_weighted(sites_quimbaya_poly, "Quimbaya", bound_quimbaya)
+
+p_tai <- create_panel(d_tai, bound_tairona, "Tairona (Río Frío) Region")
+p_qui <- create_panel(d_qui, bound_quimbaya, "Quimbaya (Filandia) Region")
+
+p_combined <- p_tai / p_qui +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Figure 2: Settlement Area Intensity (Weighted Analysis)",
+    subtitle = "Kernel Density weighted by Site Area overlaying Site Polygons",
+    theme = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+                  plot.subtitle = element_text(size = 11, hjust = 0.5))
+  )
+
+# FIGURE 2: SETTLEMENT AREA INTENSITY (WEIGHTED ANALYSIS)
+print(p_combined)
+
+summ_stats <- bind_rows(
+  d_tai$raster %>% group_by(Period) %>%
+    summarise(Region = "Tairona", Max_Intensity_Ha_km2 = round(max(value_scaled), 2), 
+              Mean_Intensity_Ha_km2 = round(mean(value_scaled), 2)),
+  d_qui$raster %>% group_by(Period) %>%
+    summarise(Region = "Quimbaya", Max_Intensity_Ha_km2 = round(max(value_scaled), 2), 
+              Mean_Intensity_Ha_km2 = round(mean(value_scaled), 2))
+)
+
+print(summ_stats)
+
+rm(sites_tairona_poly, sites_quimbaya_poly, d_tai, d_qui)
+```
+
+# Section 6: Procedure 2 - Settlement Organization Models
+
+```{r settlement_models, fig.width=10, fig.height=6}
+run_abc_robust <- function(pp, label, n_sim = 99, n_r = 50) {
+  r_max <- min(diff(pp$window$xrange), diff(pp$window$yrange)) / 4
+  r_vals <- seq(0, r_max, length.out = n_r)
+  K_obs <- Kest(pp, r = r_vals, correction = "isotropic")
+  L_obs <- sqrt(K_obs$iso / pi) - K_obs$r
+  lambda <- pp$n / area.owin(pp$window)
+  d_mean <- mean(nndist(pp))
+  calc_summary_stats <- function(sim_pp, r_vals) {
+    if(is.null(sim_pp) || sim_pp$n < 5) return(rep(NA, 4))
+    K_sim <- Kest(sim_pp, r = r_vals, correction = "isotropic")
+    L_sim <- sqrt(K_sim$iso / pi) - K_sim$r
+    c(
+      L_integral = sum(L_sim, na.rm = TRUE),
+      L_max = max(L_sim, na.rm = TRUE),
+      L_min = min(L_sim, na.rm = TRUE),
+      nn_mean = mean(nndist(sim_pp))
+    )
+  }
+  obs_stats <- c(
+    L_integral = sum(L_obs, na.rm = TRUE),
+    L_max = max(L_obs, na.rm = TRUE),
+    L_min = min(L_obs, na.rm = TRUE),
+    nn_mean = mean(nndist(pp))
+  )
+  simulate_and_score <- function(generator, n_sim) {
+    distances <- numeric(n_sim)
+    for(i in 1:n_sim) {
+      sim_pp <- tryCatch(generator(), error = function(e) NULL)
+      sim_stats <- calc_summary_stats(sim_pp, r_vals)
+      if(any(is.na(sim_stats))) {
+        distances[i] <- Inf
+      } else {
+        distances[i] <- sqrt(sum(((sim_stats - obs_stats) / (abs(obs_stats) + 1e-10))^2))
+      }
+    }
+    distances
+  }
+  gen_csr <- function() rpoispp(lambda, win = pp$window)
+  gen_thomas <- function() {
+    kappa <- lambda * runif(1, 0.1, 0.3)
+    scale <- d_mean * runif(1, 0.5, 2.0)
+    mu <- runif(1, 3, 10)
+    tryCatch(
+      rThomas(kappa = kappa, scale = scale, mu = mu, win = pp$window),
+      error = function(e) NULL
+    )
+  }
+  gen_strauss <- function() {
+    tryCatch(
+      rStrauss(beta = lambda * runif(1, 1.2, 2.0), 
+               gamma = runif(1, 0.2, 0.8), 
+               R = d_mean * runif(1, 0.3, 0.7), 
+               W = pp$window),
+      error = function(e) NULL
+    )
+  }
+  dist_csr <- simulate_and_score(gen_csr, n_sim)
+  dist_thomas <- simulate_and_score(gen_thomas, n_sim)
+  dist_strauss <- simulate_and_score(gen_strauss, n_sim)
+  epsilon <- quantile(c(dist_csr, dist_thomas, dist_strauss), 0.05, na.rm = TRUE)
+  accept_csr <- sum(dist_csr <= epsilon, na.rm = TRUE)
+  accept_thomas <- sum(dist_thomas <= epsilon, na.rm = TRUE)
+  accept_strauss <- sum(dist_strauss <= epsilon, na.rm = TRUE)
+  total_accept <- accept_csr + accept_thomas + accept_strauss
+  prob_csr <- (accept_csr + 1) / (total_accept + 3)
+  prob_thomas <- (accept_thomas + 1) / (total_accept + 3)
+  prob_strauss <- (accept_strauss + 1) / (total_accept + 3)
+  bf_raw <- prob_thomas / prob_csr
+  bf_capped <- min(bf_raw, 100)
+  tibble(
+    Period = label,
+    Unstructured = round(prob_csr, 3),
+    Nucleated = round(prob_thomas, 3),
+    Dispersed = round(prob_strauss, 3),
+    BF_Nucleation = round(bf_capped, 2),
+    Best_Model = c("Unstructured", "Nucleated", "Dispersed")[which.max(c(prob_csr, prob_thomas, prob_strauss))]
+  )
+}
+
+res_abc <- bind_rows(
+  lapply(names(ppp_tairona), function(p) {
+    run_abc_robust(ppp_tairona[[p]], p)
+  }),
+  lapply(names(ppp_quimbaya), function(p) {
+    run_abc_robust(ppp_quimbaya[[p]], p)
+  })
+)
+
+gc(verbose = FALSE)
+
+df_abc_long <- res_abc %>% 
+  select(Period, Unstructured, Nucleated, Dispersed) %>%
+  pivot_longer(cols = c(Unstructured, Nucleated, Dispersed), 
+               names_to = "Organization_Model", values_to = "Probability")
+
+df_abc_long$Period <- factor(df_abc_long$Period, 
+                             levels = c("Neguanje", "Early", "Buritaca", "Middle", "Tairona", "Late"))
+
+df_abc_long$Organization_Model <- factor(df_abc_long$Organization_Model,
+                                         levels = c("Unstructured", "Nucleated", "Dispersed"))
+
+p3 <- ggplot(df_abc_long, aes(x = Period, y = Probability, fill = Organization_Model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0.33, linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  theme_bw() + 
+  scale_fill_manual(values = c("Unstructured" = "#999999", 
+                               "Nucleated" = "#E69F00", 
+                               "Dispersed" = "#56B4E9"),
+                    labels = c("Unstructured" = "Unstructured\n(random infilling)", 
+                               "Nucleated" = "Nucleated\n(village clusters)", 
+                               "Dispersed" = "Dispersed\n(homestead spacing)"),
+                    name = "Settlement\nOrganization") +
+  labs(title = "Figure 3: Settlement Organization Model Selection", 
+       subtitle = "Posterior probability via simulation-based inference | Dashed line = equiprobable threshold", 
+       x = NULL, y = "Posterior Probability") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        plot.title = element_text(face = "bold", size = 12),
+        legend.position = "right") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25))
+
+# FIGURE 3: SETTLEMENT ORGANIZATION MODEL SELECTION
+print(p3)
+
+print(res_abc)
+```
+
+# Section 7: Procedure 3 - Multiscale Spatial Complexity
+
+```{r spatial_complexity_boxplot, fig.width=11, fig.height=5}
+run_tda_with_replicates <- function(pp, label, region, global_maxscale, n_subsample = 100, n_boot = 50) {
+  
+  if(pp$n > n_subsample) {
+    idx <- sample(1:pp$n, n_subsample)
+    coords <- cbind(pp$x[idx], pp$y[idx])
+  } else {
+    coords <- cbind(pp$x, pp$y)
+    n_subsample <- pp$n
+  }
+  
+  calc_persistence <- function(coord_matrix, maxscale) {
+    diag_result <- tryCatch(
+      ripsDiag(X = coord_matrix, maxdimension = 1, maxscale = maxscale, 
+               library = "GUDHI", printProgress = FALSE),
+      error = function(e) NULL
+    )
+    
+    if(is.null(diag_result)) return(NA)
+    
+    dm <- diag_result$diagram
+    if(is.null(dm) || length(dm) == 0) return(0)
+    if(!is.matrix(dm)) dm <- t(as.matrix(dm))
+    
+    h1 <- dm[dm[,1] == 1, , drop = FALSE]
+    if(nrow(h1) == 0) return(0)
+    
+    sum(h1[,3] - h1[,2])
+  }
+  
+  boot_persistence <- numeric(n_boot)
+  n_pts <- nrow(coords)
+  
+  for(b in 1:n_boot) {
+    boot_idx <- sample(1:n_pts, size = floor(n_pts * 0.8), replace = FALSE)
+    boot_coords <- coords[boot_idx, ]
+    boot_persistence[b] <- calc_persistence(boot_coords, global_maxscale)
+  }
+  
+  boot_persistence <- boot_persistence[!is.na(boot_persistence)]
+  
+  tibble(
+    Region = region,
+    Period = label,
+    Spatial_Complexity = boot_persistence / n_subsample
+  )
+}
+
+all_nn_means <- c(
+  sapply(ppp_tairona, function(pp) mean(nndist(pp))),
+  sapply(ppp_quimbaya, function(pp) mean(nndist(pp)))
+)
+global_maxscale <- max(all_nn_means) * 3
+
+set.seed(42)
+tda_boot_data <- bind_rows(
+  lapply(names(ppp_tairona), function(p) {
+    run_tda_with_replicates(ppp_tairona[[p]], p, "Tairona", global_maxscale)
+  }),
+  lapply(names(ppp_quimbaya), function(p) {
+    run_tda_with_replicates(ppp_quimbaya[[p]], p, "Quimbaya", global_maxscale)
+  })
+)
+
+tda_tairona <- tda_boot_data %>% 
+  filter(Region == "Tairona") %>%
+  mutate(Period = factor(Period, levels = c("Neguanje", "Buritaca", "Tairona")))
+
+tda_quimbaya <- tda_boot_data %>% 
+  filter(Region == "Quimbaya") %>%
+  mutate(Period = factor(Period, levels = c("Early", "Middle", "Late")))
+
+format_pvalue <- function(p) {
+  case_when(
+    p < 0.0001 ~ "p < 0.0001",
+    p < 0.001 ~ "p < 0.001",
+    p < 0.01 ~ paste0("p = ", formatC(p, format = "f", digits = 3)),
+    p < 0.05 ~ paste0("p = ", formatC(p, format = "f", digits = 3)),
+    TRUE ~ paste0("p = ", formatC(p, format = "f", digits = 2))
+  )
+}
+
+tairona_comparisons <- list(c("Neguanje", "Buritaca"), c("Buritaca", "Tairona"), c("Neguanje", "Tairona"))
+quimbaya_comparisons <- list(c("Early", "Middle"), c("Middle", "Late"), c("Early", "Late"))
+
+calc_pvalues <- function(data, comparisons) {
+  sapply(comparisons, function(comp) {
+    x <- data %>% filter(Period == comp[1]) %>% pull(Spatial_Complexity)
+    y <- data %>% filter(Period == comp[2]) %>% pull(Spatial_Complexity)
+    wilcox.test(x, y)$p.value
+  })
+}
+
+pvals_tairona <- calc_pvalues(tda_tairona, tairona_comparisons)
+pvals_quimbaya <- calc_pvalues(tda_quimbaya, quimbaya_comparisons)
+
+create_bracket_df <- function(comparisons, pvalues, y_positions) {
+  tibble(
+    group1 = sapply(comparisons, `[`, 1),
+    group2 = sapply(comparisons, `[`, 2),
+    p = pvalues,
+    label = sapply(pvalues, format_pvalue),
+    y.position = y_positions
+  )
+}
+
+y_max_tai <- max(tda_tairona$Spatial_Complexity) * 1.1
+y_max_qui <- max(tda_quimbaya$Spatial_Complexity) * 1.1
+
+bracket_tai <- create_bracket_df(
+  tairona_comparisons, 
+  pvals_tairona, 
+  c(y_max_tai * 0.85, y_max_tai * 0.95, y_max_tai * 1.08)
+)
+
+bracket_qui <- create_bracket_df(
+  quimbaya_comparisons, 
+  pvals_quimbaya, 
+  c(y_max_qui * 0.85, y_max_qui * 0.95, y_max_qui * 1.08)
+)
+
+p4_tairona <- ggplot(tda_tairona, aes(x = Period, y = Spatial_Complexity)) +
+  geom_boxplot(fill = "#4B0082", alpha = 0.6, width = 0.5, outlier.shape = NA) +
+  geom_jitter(color = "#4B0082", size = 1.5, alpha = 0.5, width = 0.15) +
+  stat_pvalue_manual(bracket_tai, label = "label", 
+                     tip.length = 0.02, bracket.size = 0.4, size = 3) +
+  labs(title = "Tairona (Río Frío)", x = NULL, y = "Spatial Complexity Index") +
+  coord_cartesian(ylim = c(0, y_max_tai * 1.15)) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+        axis.text.x = element_text(size = 10))
+
+p4_quimbaya <- ggplot(tda_quimbaya, aes(x = Period, y = Spatial_Complexity)) +
+  geom_boxplot(fill = "#D55E00", alpha = 0.6, width = 0.5, outlier.shape = NA) +
+  geom_jitter(color = "#D55E00", size = 1.5, alpha = 0.5, width = 0.15) +
+  stat_pvalue_manual(bracket_qui, label = "label",
+                     tip.length = 0.02, bracket.size = 0.4, size = 3) +
+  labs(title = "Quimbaya (Filandia)", x = NULL, y = NULL) +
+  coord_cartesian(ylim = c(0, y_max_qui * 1.15)) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+        axis.text.x = element_text(size = 10))
+
+p4_combined <- p4_tairona + p4_quimbaya +
+  plot_annotation(
+    title = "Figure 4: Spatial Complexity Across Periods",
+    subtitle = "Bootstrap distributions (n=50) with pairwise Wilcoxon rank-sum tests",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+      plot.subtitle = element_text(size = 9, hjust = 0.5)
+    )
+  )
+
+# FIGURE 4: SPATIAL COMPLEXITY ACROSS PERIODS
+print(p4_combined)
+
+summary_stats <- bind_rows(
+  tda_tairona %>%
+    group_by(Period) %>%
+    summarise(Region = "Tairona", Median = round(median(Spatial_Complexity), 3),
+              IQR = round(IQR(Spatial_Complexity), 3),
+              CI_95_Low = round(quantile(Spatial_Complexity, 0.025), 3),
+              CI_95_High = round(quantile(Spatial_Complexity, 0.975), 3), .groups = "drop"),
+  tda_quimbaya %>%
+    group_by(Period) %>%
+    summarise(Region = "Quimbaya", Median = round(median(Spatial_Complexity), 3),
+              IQR = round(IQR(Spatial_Complexity), 3),
+              CI_95_Low = round(quantile(Spatial_Complexity, 0.025), 3),
+              CI_95_High = round(quantile(Spatial_Complexity, 0.975), 3), .groups = "drop")
+) %>% select(Region, Period, Median, IQR, CI_95_Low, CI_95_High)
+print(summary_stats)
+
+intra_results <- tibble(
+  Region = c(rep("Tairona", 3), rep("Quimbaya", 3)),
+  Comparison = c("Neguanje vs Buritaca", "Buritaca vs Tairona", "Neguanje vs Tairona",
+                 "Early vs Middle", "Middle vs Late", "Early vs Late"),
+  p_value = c(pvals_tairona, pvals_quimbaya),
+  Significance = ifelse(p_value < 0.05, "Significant", "Not significant")
+) %>% mutate(p_value = round(p_value, 4))
+print(intra_results)
+
+inter_results <- tibble(
+  Tairona_Period = c("Neguanje", "Buritaca", "Tairona"),
+  Quimbaya_Period = c("Early", "Middle", "Late"),
+  p_value = c(
+    wilcox.test(tda_tairona %>% filter(Period == "Neguanje") %>% pull(Spatial_Complexity),
+                tda_quimbaya %>% filter(Period == "Early") %>% pull(Spatial_Complexity))$p.value,
+    wilcox.test(tda_tairona %>% filter(Period == "Buritaca") %>% pull(Spatial_Complexity),
+                tda_quimbaya %>% filter(Period == "Middle") %>% pull(Spatial_Complexity))$p.value,
+    wilcox.test(tda_tairona %>% filter(Period == "Tairona") %>% pull(Spatial_Complexity),
+                tda_quimbaya %>% filter(Period == "Late") %>% pull(Spatial_Complexity))$p.value
+  ),
+  Significance = ifelse(p_value < 0.05, "Significant", "Not significant")
+) %>% mutate(p_value = round(p_value, 4))
+print(inter_results)
+
+summ_tda <- summary_stats %>%
+  mutate(Period = paste(substr(Region, 1, 3), Period),
+         Spatial_Complexity = Median) %>%
+  select(Period, Spatial_Complexity)
+```
+
+# Section 8: Procedure 4 - Inter-Settlement Connectivity Networks
+
+```{r connectivity_networks, fig.width=12, fig.height=8}
+build_knn_network <- function(pp, k = 6) {
+  coords <- cbind(pp$x, pp$y)
+  n <- nrow(coords)
+  D <- as.matrix(dist(coords))
+  
+  adj_knn <- matrix(FALSE, nrow = n, ncol = n)
+  for(i in 1:n) {
+    k_eff <- min(k, n - 1)
+    neighbors <- order(D[i, ])[2:(k_eff + 1)]
+    adj_knn[i, neighbors] <- TRUE
+  }
+  adj_knn <- adj_knn | t(adj_knn)
+  
+  g <- graph_from_adjacency_matrix(adj_knn, mode = "undirected")
+  deg <- degree(g)
+  
+  base_metrics <- c(
+    avg_degree = mean(deg),
+    degree_cv = sd(deg) / mean(deg),
+    transitivity = transitivity(g, type = "global"),
+    degree_centralization = centr_degree(g)$centralization,
+    assortativity = assortativity_degree(g, directed = FALSE)
+  )
+  
+  list(coords = coords, adj = adj_knn, degree = deg, 
+       summary = tibble(Metric = names(base_metrics), Value = as.numeric(base_metrics)))
+}
+
+plot_knn_network <- function(pp, bound_sf, label, color_low, color_high, k = 6) {
+  net_result <- build_knn_network(pp, k = k)
+  coords <- net_result$coords
+  adj <- net_result$adj
+  deg <- net_result$degree
+  
+  edges <- which(adj & upper.tri(adj), arr.ind = TRUE)
+  seg_df <- if(nrow(edges) > 0) {
+    data.frame(x = coords[edges[,1], 1], y = coords[edges[,1], 2],
+               xend = coords[edges[,2], 1], yend = coords[edges[,2], 2])
+  } else {
+    data.frame(x = numeric(), y = numeric(), xend = numeric(), yend = numeric())
+  }
+  
+  z_degree <- scale(deg)[,1]
+  nodes_df <- data.frame(x = coords[,1], y = coords[,2], z_score = z_degree)
+  
+  p <- ggplot() +
+    geom_sf(data = bound_sf, fill = "gray97", color = "gray85") +
+    geom_segment(data = seg_df, aes(x = x, y = y, xend = xend, yend = yend),
+                 color = "gray60", linewidth = 0.2, alpha = 0.4) +
+    geom_point(data = nodes_df, 
+               aes(x = x, y = y, fill = z_score, size = abs(z_score)), 
+               shape = 21, color = "black", stroke = 0.6, alpha = 1) +
+    scale_fill_gradient2(low = color_low, mid = "gray85", high = color_high,
+                         midpoint = 0, name = "Connectivity\n(Z-score)",
+                         guide = guide_colorbar(order = 1)) +
+    scale_size_continuous(range = c(1, 5), 
+                          name = "Magnitude\n(Abs Z)",
+                          guide = guide_legend(order = 2)) +
+    theme_void() + 
+    annotation_scale(location = "br", width_hint = 0.25, style = "ticks") +
+    annotation_north_arrow(location = "tl", which_north = "true", 
+                           style = north_arrow_minimal(), height = unit(0.6, "cm")) +
+    labs(subtitle = label) + 
+    theme(
+      plot.subtitle = element_text(hjust = 0.5, size = 9, face = "bold"),
+      legend.position = "right",
+      legend.title = element_text(size = 7, face = "bold"),
+      legend.text = element_text(size = 6),
+      legend.key.size = unit(0.35, "cm")
+    )
+  
+  list(plot = p, summary = net_result$summary)
+}
+
+K_FIXED <- 6
+
+net_tairona <- lapply(names(ppp_tairona), function(p) {
+  plot_knn_network(ppp_tairona[[p]], bound_tairona, p, "#1E90FF", "#4B0082", k = K_FIXED)
+})
+names(net_tairona) <- names(ppp_tairona)
+
+net_quimbaya <- lapply(names(ppp_quimbaya), function(p) {
+  plot_knn_network(ppp_quimbaya[[p]], bound_quimbaya, p, "#FFD700", "#8B0000", k = K_FIXED)
+})
+names(net_quimbaya) <- names(ppp_quimbaya)
+
+# FIGURE 5: INTER-SETTLEMENT CONNECTIVITY NETWORKS
+wrap_plots(c(lapply(net_tairona, function(x) x$plot), 
+             lapply(net_quimbaya, function(x) x$plot)), ncol = 3) + 
+  plot_annotation(
+    title = "Figure 5: Inter-Settlement Connectivity Networks",
+    subtitle = "k-NN construction (k=6) | Color: Z-score | Tairona (Blue-Purple) | Quimbaya (Gold-Red)",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+                  plot.subtitle = element_text(hjust = 0.5, size = 10))
+  )
+
+summ_net_display <- bind_rows(
+  lapply(names(net_tairona), function(p) {
+    s <- net_tairona[[p]]$summary
+    tibble(Period = paste("Tai", p), N_Sites = ppp_tairona[[p]]$n,
+           Local_Clustering = round(s$Value[3], 3),
+           Network_Centralization = round(s$Value[4], 4))
+  }),
+  lapply(names(net_quimbaya), function(p) {
+    s <- net_quimbaya[[p]]$summary
+    tibble(Period = paste("Qui", p), N_Sites = ppp_quimbaya[[p]]$n,
+           Local_Clustering = round(s$Value[3], 3),
+           Network_Centralization = round(s$Value[4], 4))
+  })
+)
+print(summ_net_display)
+```
+
+# Section 9: Final Synthesis - Regional Integration Signatures
+
+```{r integration_signatures, fig.width=12, fig.height=10}
+extract_net_metric <- function(net_list, metric_idx) {
+  sapply(net_list, function(x) x$summary$Value[metric_idx])
+}
+
+table2 <- tibble(
+  Region = c(rep("Tairona", 3), rep("Quimbaya", 3)),
+  Period = c("Neguanje", "Buritaca", "Tairona", "Early", "Middle", "Late")
+) %>%
+  mutate(Key = paste(substr(Region, 1, 3), Period)) %>%
+  left_join(summ_tda %>% rename(Key = Period) %>% select(Key, Spatial_Complexity), by = "Key") %>%
+  mutate(
+    Network_Centralization = c(extract_net_metric(net_tairona, 4), extract_net_metric(net_quimbaya, 4)),
+    Local_Network_Clustering = c(extract_net_metric(net_tairona, 3), extract_net_metric(net_quimbaya, 3))
+  ) %>%
+  left_join(res_abc %>% select(Period, Best_Model, Unstructured, Nucleated, Dispersed), by = "Period") %>%
+  mutate(
+    Model_Probability = pmax(Unstructured, Nucleated, Dispersed)
+  ) %>%
+  select(Region, Period, Spatial_Complexity, Network_Centralization, Local_Network_Clustering, Best_Model, Model_Probability)
+
+# TABLE 2: ORGANIZATIONAL STRATEGIES AND INTEGRATION MODELS
+print(table2)
+
+full_data_viz <- table1 %>%
+  left_join(table2, by = c("Region", "Period")) 
+
+df_viz <- full_data_viz %>%
+  mutate(Label = paste(Region, Period)) %>%
+  select(Label, Region, Period, Settlement_Density, Clark_Evans_R, Spatial_Complexity, 
+         Network_Centralization, Local_Network_Clustering) %>%
+  pivot_longer(cols = c(Settlement_Density, Clark_Evans_R, Spatial_Complexity, 
+                        Network_Centralization, Local_Network_Clustering), 
+               names_to = "Metric", values_to = "Value") %>%
+  group_by(Metric) %>% 
+  mutate(Z = as.numeric(scale(Value))) %>% 
+  ungroup()
+
+df_viz$Label <- factor(df_viz$Label, 
+                       levels = c("Tairona Neguanje", "Tairona Buritaca", "Tairona Tairona",
+                                  "Quimbaya Early", "Quimbaya Middle", "Quimbaya Late"))
+
+df_viz$Period <- factor(df_viz$Period, 
+                        levels = c("Neguanje", "Buritaca", "Tairona", "Early", "Middle", "Late"))
+
+df_viz <- df_viz %>%
+  mutate(Metric_Label = case_when(
+    Metric == "Settlement_Density" ~ "Settlement\nDensity",
+    Metric == "Clark_Evans_R" ~ "Nucleation\nIndex",
+    Metric == "Spatial_Complexity" ~ "Landscape\nComplexity",
+    Metric == "Network_Centralization" ~ "Network\nCentralization",
+    Metric == "Local_Network_Clustering" ~ "Local\nClustering",
+    TRUE ~ Metric
+  ))
+
+p6 <- ggplot(df_viz, aes(x = Metric_Label, y = Z, fill = Region)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray40", linewidth = 0.6) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.85) +
+  geom_text(aes(label = round(Z, 2), vjust = ifelse(Z >= 0, -0.5, 1.5)),
+            position = position_dodge(width = 0.8), size = 2.5) +
+  facet_wrap(~Period, ncol = 3, scales = "fixed") +
+  scale_fill_manual(values = c("Tairona" = "#4B0082", "Quimbaya" = "#D55E00"), name = "Region") +
+  scale_y_continuous(limits = c(-2.5, 2.5), breaks = seq(-2, 2, 1)) +
+  theme_bw() +
+  labs(title = "Figure 6: Regional Integration Signatures by Period",
+       subtitle = "Standardized metrics (Z-scores) | Positive = above average | Negative = below average",
+       x = NULL, y = "Standardized Score (Z)") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 7),
+        strip.text = element_text(face = "bold", size = 10),
+        strip.background = element_rect(fill = "gray95"),
+        plot.title = element_text(face = "bold", size = 12),
+        legend.position = "bottom", panel.grid.minor = element_blank())
+
+# FIGURE 6: REGIONAL INTEGRATION SIGNATURES BY PERIOD
+print(p6)
+
+temporal_change <- df_viz %>%
+  mutate(Time_Order = case_when(
+    Period %in% c("Neguanje", "Early") ~ 1,
+    Period %in% c("Buritaca", "Middle") ~ 2,
+    Period %in% c("Tairona", "Late") ~ 3
+  )) %>%
+  group_by(Region, Metric) %>%
+  arrange(Time_Order) %>%
+  summarise(
+    Delta_Z = round(last(Z) - first(Z), 2),
+    Trajectory = case_when(
+      abs(last(Z) - first(Z)) < 0.3 ~ "Stable",
+      last(Z) > first(Z) ~ "Intensifying",
+      TRUE ~ "Decreasing"
+    ), .groups = "drop"
+  )
+
+print(temporal_change)
+```
+
+# Section 10: Procedure 5 - Machine Learning Classification of Regional Signatures
+
+```{r ml_classification, fig.width=14, fig.height=7}
+sites_tairona_poly <- list(
+  Neguanje = read_sf_from_github("Rio_Frio_Sitios_Neguanje"),
+  Buritaca = read_sf_from_github("Rio_Frio_Sitios_Buritaca"),
+  Tairona  = read_sf_from_github("Rio_Frio_Sitios_Tairona")
+)
+
+sites_quimbaya_poly <- list(
+  Early    = read_sf_from_github("Filandia_Sitios_Periodo_Temprano"),
+  Middle   = read_sf_from_github("Filandia_Sitios_Periodo_Medio"),
+  Late     = read_sf_from_github("Filandia_Sitios_Periodo_Tardio")
+)
+
+extract_site_features <- function(poly_list, ppp_list, region_name) {
+  bind_rows(lapply(names(poly_list), function(p) {
+    polys <- poly_list[[p]]
+    pts <- ppp_list[[p]]
+    n_sites <- pts$n
+    
+    nnd_vals <- nndist(pts)
+    
+    dens_map <- density(pts, sigma = bw.ppl(pts), edge = TRUE)
+    dens_vals <- interp.im(dens_map, pts$x, pts$y)
+    
+    k <- 5
+    D <- as.matrix(dist(cbind(pts$x, pts$y)))
+    regularity_vals <- sapply(1:nrow(D), function(i) {
+      knn_dists <- sort(D[i, ])[2:(k+1)]
+      cv <- sd(knn_dists) / mean(knn_dists)
+      return(1 / (cv + 0.1))
+    })
+    
+    k_net <- 6
+    coords <- cbind(pts$x, pts$y)
+    adj_knn <- matrix(FALSE, nrow = n_sites, ncol = n_sites)
+    for(i in 1:n_sites) {
+      neighbors <- order(D[i, ])[2:(k_net+1)]
+      adj_knn[i, neighbors] <- TRUE
+    }
+    adj_knn <- adj_knn | t(adj_knn)
+    
+    g <- graph_from_adjacency_matrix(adj_knn, mode = "undirected")
+    
+    betweenness_vals <- betweenness(g, normalized = TRUE)
+    
+    clustering_vals <- transitivity(g, type = "local")
+    clustering_vals[is.nan(clustering_vals)] <- 0
+    
+    tibble(
+      Region = factor(region_name),
+      Period = p,
+      NND = nnd_vals,
+      Local_Density = as.numeric(dens_vals),
+      Spacing_Regularity = regularity_vals,
+      Betweenness = betweenness_vals,
+      Local_Clustering = clustering_vals
+    )
+  }))
+}
+
+data_ml_tai <- extract_site_features(sites_tairona_poly, ppp_tairona, "Tairona")
+data_ml_qui <- extract_site_features(sites_quimbaya_poly, ppp_quimbaya, "Quimbaya")
+data_all <- bind_rows(data_ml_tai, data_ml_qui)
+
+data_all <- data_all %>%
+  mutate(Region_Period = paste(Region, Period, sep = " - "))
+
+sample_sizes <- data_all %>%
+  group_by(Region, Period) %>%
+  summarise(N = n(), .groups = "drop")
+
+set.seed(42)
+trainIndex <- createDataPartition(data_all$Region, p = .75, list = FALSE, times = 1)
+dataTrain <- data_all[trainIndex,]
+dataTest  <- data_all[-trainIndex,]
+
+rf_model <- randomForest(Region ~ NND + Local_Density + Spacing_Regularity + Betweenness + Local_Clustering,
+                         data = dataTrain,
+                         ntree = 1000,
+                         importance = TRUE)
+
+pred <- predict(rf_model, dataTest)
+cm <- confusionMatrix(pred, dataTest$Region)
+
+imp_df <- as.data.frame(importance(rf_model))
+imp_df$Variable <- rownames(imp_df)
+
+imp_df <- imp_df %>%
+  mutate(
+    Variable_Label = case_when(
+      Variable == "NND" ~ "Inter-Site Spacing",
+      Variable == "Local_Density" ~ "Nucleation Intensity",
+      Variable == "Spacing_Regularity" ~ "Spacing Regularity",
+      Variable == "Betweenness" ~ "Network Brokerage",
+      Variable == "Local_Clustering" ~ "Local Cohesion"
+    ),
+    Importance_Scaled = MeanDecreaseGini / max(MeanDecreaseGini) * 100
+  ) %>%
+  arrange(desc(Importance_Scaled))
+
+acc_text <- paste0("Accuracy: ", round(cm$overall['Accuracy'] * 100, 1), "%")
+kappa_text <- paste0("Kappa = ", round(cm$overall['Kappa'], 2))
+
+pca_vars <- c("NND", "Local_Density", "Spacing_Regularity", "Betweenness", "Local_Clustering")
+data_scaled <- data_all %>%
+  mutate(across(all_of(pca_vars), scale))
+
+pca_result <- prcomp(data_scaled[, pca_vars], center = FALSE, scale. = FALSE)
+
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+pca_scores$Region <- data_all$Region
+pca_scores$Period <- data_all$Period
+pca_scores$Region_Period <- data_all$Region_Period
+
+centroids <- pca_scores %>%
+  group_by(Region, Period, Region_Period) %>%
+  summarise(PC1 = mean(PC1), PC2 = mean(PC2), N = n(), .groups = "drop")
+
+var_explained <- round(summary(pca_result)$importance[2, 1:2] * 100, 1)
+
+loadings <- as.data.frame(pca_result$rotation[, 1:2])
+loadings$Variable <- imp_df$Variable_Label[match(rownames(loadings), imp_df$Variable)]
+arrow_scale <- 3
+
+p8a_pca <- ggplot() +
+  geom_point(data = pca_scores, aes(x = PC1, y = PC2, color = Region), 
+             alpha = 0.15, size = 1) +
+  geom_point(data = centroids, aes(x = PC1, y = PC2, fill = Region), 
+             shape = 21, size = 10, color = "white", stroke = 1.5) +
+  geom_text(data = centroids, aes(x = PC1, y = PC2, label = N),
+            size = 3.5, fontface = "bold", color = "white") +
+  geom_text(data = centroids, aes(x = PC1, y = PC2 - 0.7, label = Period, color = Region),
+            size = 3, fontface = "bold", vjust = 1, show.legend = FALSE) +
+  geom_segment(data = loadings, 
+               aes(x = 0, y = 0, xend = PC1 * arrow_scale, yend = PC2 * arrow_scale),
+               arrow = arrow(length = unit(0.2, "cm")), color = "gray40", linewidth = 0.7) +
+  geom_text(data = loadings,
+            aes(x = PC1 * arrow_scale * 1.15, y = PC2 * arrow_scale * 1.15, label = Variable),
+            size = 2.8, color = "gray30", fontface = "italic") +
+  scale_color_manual(values = c("Tairona" = "#4B0082", "Quimbaya" = "#D55E00")) +
+  scale_fill_manual(values = c("Tairona" = "#4B0082", "Quimbaya" = "#D55E00")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  labs(
+    title = "Figure 7a: PCA of Spatial Signatures",
+    subtitle = paste0("Centroids by period (N = sample size) | ", acc_text),
+    x = paste0("PC1 (", var_explained[1], "% variance)"),
+    y = paste0("PC2 (", var_explained[2], "% variance)")
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 9, color = "gray50"),
+    legend.position = "bottom"
+  ) +
+  coord_fixed()
+
+n_vars <- nrow(imp_df)
+radar_poly <- imp_df %>%
+  arrange(Variable_Label) %>%
+  mutate(
+    angle = seq(0, 2*pi, length.out = n() + 1)[1:n()] - pi/2,
+    x = Importance_Scaled * cos(angle),
+    y = Importance_Scaled * sin(angle)
+  )
+
+radar_poly_closed <- bind_rows(radar_poly, radar_poly[1,])
+
+create_circle <- function(r, n_points = 100) {
+  theta <- seq(0, 2*pi, length.out = n_points)
+  data.frame(x = r * cos(theta), y = r * sin(theta), r = r)
+}
+
+circles <- bind_rows(create_circle(25), create_circle(50), create_circle(75), create_circle(100))
+
+label_data <- radar_poly %>%
+  mutate(
+    label_r = 130,
+    label_x = label_r * cos(angle),
+    label_y = label_r * sin(angle)
+  )
+
+p8b_radar <- ggplot() +
+  geom_path(data = circles, aes(x = x, y = y, group = r), color = "gray80", linewidth = 0.4) +
+  annotate("text", x = rep(8, 4), y = c(25, 50, 75, 100), 
+           label = c("25%", "50%", "75%", "100%"), size = 2.5, color = "gray55", hjust = 0) +
+  geom_segment(data = radar_poly,
+               aes(x = 0, y = 0, xend = 108 * cos(angle), yend = 108 * sin(angle)),
+               color = "gray70", linewidth = 0.5) +
+  geom_polygon(data = radar_poly_closed, aes(x = x, y = y),
+               fill = "#E69F00", alpha = 0.4, color = "#D55E00", linewidth = 1.8) +
+  geom_point(data = radar_poly, aes(x = x, y = y),
+             color = "#D55E00", fill = "white", shape = 21, size = 5, stroke = 2) +
+  geom_text(data = radar_poly,
+            aes(x = (Importance_Scaled + 14) * cos(angle),
+                y = (Importance_Scaled + 14) * sin(angle),
+                label = paste0(round(Importance_Scaled, 0), "%")),
+            size = 3.5, fontface = "bold", color = "#B8520F") +
+  geom_label(data = label_data,
+             aes(x = label_x, y = label_y, label = Variable_Label),
+             size = 3.2, fontface = "bold", color = "gray20",
+             fill = "white", label.size = 0, label.padding = unit(0.15, "lines")) +
+  annotate("text", x = 0, y = 12, label = round(cm$overall['Accuracy'] * 100, 1),
+           size = 9, fontface = "bold", color = "#2E7D32") +
+  annotate("text", x = 0, y = -5, label = "% Accuracy", size = 3.2, color = "gray50") +
+  annotate("text", x = 0, y = -18, label = kappa_text, size = 2.8, fontface = "italic", color = "gray50") +
+  coord_fixed(xlim = c(-155, 155), ylim = c(-155, 155)) +
+  labs(
+    title = "Figure 7b: Variable Importance Profile",
+    subtitle = "Random Forest discrimination power"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 9, hjust = 0.5, color = "gray50"),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+p8_combined <- p8a_pca + p8b_radar +
+  plot_annotation(
+    title = "Figure 7: Machine Learning Classification of Regional Spatial Signatures",
+    subtitle = "Random Forest model distinguishing Tairona from Quimbaya based on settlement spatial and network traits",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "gray50")
+    )
+  )
+
+# FIGURE 7: MACHINE LEARNING CLASSIFICATION OF REGIONAL SPATIAL SIGNATURES
+print(p8_combined)
+
+perf_summary <- tibble(
+  Metric = c("Overall Accuracy", "Kappa Statistic", "Sensitivity (Tairona)", "Sensitivity (Quimbaya)"),
+  Value = c(
+    round(cm$overall['Accuracy'], 3),
+    round(cm$overall['Kappa'], 3),
+    round(cm$byClass['Sensitivity'], 3),
+    round(cm$byClass['Specificity'], 3)
+  )
+)
+print(perf_summary)
+
+print(cm$table)
+
+print(sample_sizes)
+
+print(imp_df %>% 
+        select(Variable_Label, MeanDecreaseGini, Importance_Scaled) %>%
+        rename(Feature = Variable_Label, Raw_Importance = MeanDecreaseGini, Relative_Pct = Importance_Scaled) %>%
+        mutate(Raw_Importance = round(Raw_Importance, 2), Relative_Pct = round(Relative_Pct, 1)))
+
+print(round(pca_result$rotation[, 1:2], 3))
+
+print(centroids %>% mutate(PC1 = round(PC1, 3), PC2 = round(PC2, 3)))
+
+rm(sites_tairona_poly, sites_quimbaya_poly, data_ml_tai, data_ml_qui)
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
